@@ -1,6 +1,6 @@
 {
   "name": "dsh-ai-coding-workbench-local",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "private": true,
   "repository": {"type": "git", "url": "https://github.com/binfeng1018/dsh-ai-code-preset.git"},
   "type": "module",

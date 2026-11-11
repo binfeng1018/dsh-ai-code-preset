@@ -7,6 +7,11 @@ import { promisify } from 'node:util';
 
 export const MAX_FILE_BYTES = 1024 * 1024;
 const MAX_ENTRIES = 2000;
+const SEARCH_MAX_ENTRIES = 10000;
+const SEARCH_MAX_FILES = 2000;
+const SEARCH_MAX_BYTES = 16 * MAX_FILE_BYTES;
+const SEARCH_MAX_MS = 2000;
+const SEARCH_MAX_DEPTH = 32;
 const runFile = promisify(execFile);
 export class ApiError extends Error {
   constructor(status, message) { super(message); this.status = status; }
@@ -40,6 +45,7 @@ function contentBytes(content) {
 function normalizeError(error) {
   if (error instanceof ApiError) return error;
   if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return new ApiError(404, 'Path not found');
+  if (error.code === 'EEXIST') return new ApiError(409, 'Path already exists');
   if (error.code === 'EACCES' || error.code === 'EPERM' || error.code === 'ELOOP') return new ApiError(403, 'Path access denied');
   return new ApiError(500, 'File operation failed');
 }
@@ -66,7 +72,8 @@ export function createFileService() {
   }
   async function readResolved(project, relative) {
     const file = await resolve(project, relative);
-    const handle = await fs.open(file, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
+    if (!(await fs.lstat(file)).isFile()) fail(400, 'Path is not a regular file');
+    const handle = await fs.open(file, constants.O_RDONLY | (constants.O_NOFOLLOW || 0) | (constants.O_NONBLOCK || 0));
     try {
       const stat = await handle.stat();
       const verified = await fs.stat(await resolve(project, relative));
@@ -82,7 +89,7 @@ export function createFileService() {
         size += bytesRead;
       }
       const bytes = buffer.subarray(0, size);
-      return { path: relative, content: decode(bytes), revision: hash(bytes), mode: stat.mode & 0o777, file };
+      return { path: relative, content: decode(bytes), revision: hash(bytes), mode: stat.mode & 0o777, file, dev: stat.dev, ino: stat.ino };
     } finally { await handle.close(); }
   }
   async function locked(key, fn) {
@@ -120,6 +127,109 @@ export function createFileService() {
     },
     async read({ projectId, path: relative }) {
       return publicRead(await readResolved(project(projectId), relative));
+    },
+    async create({ projectId, path: relative, content = '' }) {
+      const selected = project(projectId);
+      const parts = validatePath(relative);
+      const bytes = contentBytes(content);
+      return locked(path.join(selected.root, ...parts), async () => {
+        const parentRelative = parts.slice(0, -1).join('/');
+        const parent = await resolve(selected, parentRelative, true);
+        const parentStat = await fs.stat(parent);
+        if (!parentStat.isDirectory()) fail(400, 'Parent is not a directory');
+        const file = path.join(parent, parts.at(-1));
+        try {
+          const existing = await fs.lstat(file);
+          if (existing.isSymbolicLink()) fail(403, 'Symbolic links are not supported');
+          fail(409, 'Path already exists');
+        } catch (error) { if (error.code !== 'ENOENT') throw error; }
+        // Exclusive creation never follows or overwrites an existing final component.
+        let handle;
+        try {
+          const checked = await fs.stat(await resolve(selected, parentRelative, true));
+          if (checked.dev !== parentStat.dev || checked.ino !== parentStat.ino) fail(409, 'Parent changed during access');
+          handle = await fs.open(file, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW || 0), 0o600);
+          const created = await handle.stat();
+          const verified = await fs.stat(await resolve(selected, relative));
+          if (verified.dev !== created.dev || verified.ino !== created.ino) fail(409, 'File changed during access');
+          await handle.writeFile(bytes);
+          await handle.sync();
+          return { path: relative, content, revision: hash(bytes) };
+        } finally { if (handle) await handle.close(); }
+      });
+    },
+    async remove({ projectId, path: relative, revision }) {
+      const selected = project(projectId);
+      validatePath(relative);
+      if (typeof revision !== 'string' || !/^[a-f0-9]{64}$/.test(revision)) fail(400, 'A SHA-256 revision is required');
+      return locked(path.join(selected.root, ...relative.split('/')), async () => {
+        const original = await readResolved(selected, relative);
+        if (original.revision !== revision) fail(409, 'File changed; reload before removing');
+        // Repeat all confinement/type/text checks immediately before unlinking.
+        const checked = await readResolved(selected, relative);
+        if (checked.revision !== revision || checked.dev !== original.dev || checked.ino !== original.ino) fail(409, 'File changed; reload before removing');
+        await fs.unlink(checked.file);
+        return { removed: true, path: relative };
+      });
+    },
+    async search({ projectId, query, mode }) {
+      const selected = project(projectId);
+      if (typeof query !== 'string' || !query.length || query.length > 200 || query.includes('\0')) fail(400, 'query must contain 1 to 200 characters');
+      if (mode !== 'name' && mode !== 'content') fail(400, 'mode must be name or content');
+      const needle = query.toLowerCase();
+      const results = [];
+      let truncated = false, entries = 0, files = 0, bytes = 0;
+      const deadline = performance.now() + SEARCH_MAX_MS;
+      const expired = () => performance.now() >= deadline;
+      async function visit(relative, depth) {
+        if (expired()) { truncated = true; return; }
+        let directory;
+        try { directory = await resolve(selected, relative, true); }
+        catch (error) { if (error instanceof ApiError || ['ENOENT', 'ENOTDIR', 'EACCES', 'EPERM'].includes(error.code)) return; throw error; }
+        const dir = await fs.opendir(directory);
+        for await (const item of dir) {
+          if (++entries > SEARCH_MAX_ENTRIES || expired()) { truncated = true; break; }
+          if (protectedPart(item.name) || item.name.toLowerCase() === 'node_modules' || item.isSymbolicLink()) continue;
+          const child = relative ? `${relative}/${item.name}` : item.name;
+          if (item.isDirectory()) {
+            if (depth >= SEARCH_MAX_DEPTH) truncated = true;
+            else await visit(child, depth + 1);
+          } else if (item.isFile()) {
+            if (++files > SEARCH_MAX_FILES) { truncated = true; break; }
+            if (mode === 'name') {
+              // Revalidate entries which may have changed since directory enumeration.
+              try {
+                const stat = await fs.lstat(await resolve(selected, child));
+                if (stat.isFile() && stat.nlink === 1 && child.toLowerCase().includes(needle)) results.push({ path: child });
+              } catch (error) { if (!(error instanceof ApiError) && !['ENOENT', 'ENOTDIR', 'EACCES', 'EPERM'].includes(error.code)) throw error; }
+            } else {
+              try {
+                const stat = await fs.lstat(await resolve(selected, child));
+                if (!stat.isFile() || stat.nlink > 1 || stat.size > MAX_FILE_BYTES) continue;
+                // Reserve a full read before access so a growing file cannot exceed the aggregate budget.
+                if (bytes + MAX_FILE_BYTES + 1 > SEARCH_MAX_BYTES) { truncated = true; break; }
+                bytes += MAX_FILE_BYTES + 1;
+                const { content } = await readResolved(selected, child);
+                bytes -= MAX_FILE_BYTES + 1 - Buffer.byteLength(content);
+                let start = 0, line = 1;
+                while (start <= content.length) {
+                  if (expired()) { truncated = true; break; }
+                  const end = content.indexOf('\n', start);
+                  const text = content.slice(start, end < 0 ? content.length : end);
+                  const match = text.toLowerCase().indexOf(needle);
+                  if (match >= 0) results.push({ path: child, line, preview: text.slice(Math.max(0, match - 80), Math.max(0, match - 80) + 240) });
+                  if (results.length === 100) { truncated = true; break; }
+                  if (end < 0) break;
+                  start = end + 1; line++;
+                }
+              } catch (error) { if (!(error instanceof ApiError) && !['ENOENT', 'ENOTDIR', 'EACCES', 'EPERM'].includes(error.code)) throw error; }
+            }
+          }
+          if (results.length === 100 || files > SEARCH_MAX_FILES || entries > SEARCH_MAX_ENTRIES || expired() || bytes >= SEARCH_MAX_BYTES) { truncated = true; break; }
+        }
+      }
+      await visit('', 0);
+      return { results, truncated };
     },
     async save({ projectId, path: relative, content, revision }) {
       const selected = project(projectId);
@@ -191,7 +301,7 @@ export async function parseRequest(request) {
 }
 
 export function registerRoutes(ctx, service = createFileService()) {
-  for (const operation of ['open', 'tree', 'read', 'save', 'diff']) {
+  for (const operation of ['open', 'tree', 'read', 'save', 'diff', 'create', 'remove', 'search']) {
     ctx.connection.fetch.register({
       path: `/api/ai-coding-workbench/${operation}`,
       methods: ['POST'],

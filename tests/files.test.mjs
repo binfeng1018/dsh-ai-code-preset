@@ -118,6 +118,110 @@ test('validates save text, bounds and required revision', async t => {
   await rejectsStatus(() => service.save({ projectId, path: 'file.txt', content: 'x' }), 400);
 });
 
+test('create exclusively makes UTF-8 files in existing parents without overwrite', async t => {
+  const { service, projectId, root } = await fixture(t);
+  await fs.mkdir(path.join(root, 'dir'));
+  const created = await service.create({ projectId, path: 'dir/new.txt', content: '' });
+  assert.deepEqual(created, { path: 'dir/new.txt', content: '', revision: createHash('sha256').update('').digest('hex') });
+  assert.deepEqual(await service.read({ projectId, path: created.path }), created);
+  await rejectsStatus(() => service.create({ projectId, path: created.path, content: 'overwrite' }), 409);
+  await rejectsStatus(() => service.create({ projectId, path: 'dir', content: '' }), 409);
+  await rejectsStatus(() => service.create({ projectId, path: 'missing/new', content: '' }), 404);
+  await rejectsStatus(() => service.create({ projectId, path: '../outside', content: '' }), 400);
+  await rejectsStatus(() => service.create({ projectId, path: '.env', content: '' }), 403);
+  await fs.symlink(path.join(root, 'dir'), path.join(root, 'alias'));
+  await fs.symlink(path.join(root, 'absent'), path.join(root, 'dangling'));
+  await rejectsStatus(() => service.create({ projectId, path: 'alias/escape', content: '' }), 403);
+  await rejectsStatus(() => service.create({ projectId, path: 'dangling', content: '' }), 403);
+  await rejectsStatus(() => service.create({ projectId, path: 'binary', content: '\0' }), 415);
+  await rejectsStatus(() => service.create({ projectId, path: 'invalid', content: '\ud800' }), 400);
+  await rejectsStatus(() => service.create({ projectId, path: 'big', content: 'a'.repeat(MAX_FILE_BYTES + 1) }), 413);
+  const racing = await Promise.allSettled(['one', 'two'].map(content => service.create({ projectId, path: 'race', content })));
+  assert.equal(racing.filter(r => r.status === 'fulfilled').length, 1);
+  assert.equal(racing.find(r => r.status === 'rejected').reason.status, 409);
+});
+
+test('remove requires the current revision and rejects unsafe/nontext targets', async t => {
+  const { service, projectId, root } = await fixture(t);
+  const original = await service.read({ projectId, path: 'file.txt' });
+  await rejectsStatus(() => service.remove({ projectId, path: 'file.txt' }), 400);
+  await rejectsStatus(() => service.remove({ projectId, ...original, revision: '0'.repeat(64) }), 409);
+  assert.deepEqual(await service.remove({ projectId, ...original }), { removed: true, path: 'file.txt' });
+  await rejectsStatus(() => service.read({ projectId, path: 'file.txt' }), 404);
+  await rejectsStatus(() => service.remove({ projectId, ...original }), 404);
+  await fs.mkdir(path.join(root, 'dir'));
+  const revision = original.revision;
+  await rejectsStatus(() => service.remove({ projectId, path: 'dir', revision }), 400);
+  for (const [name, bytes, status] of [['binary', Buffer.from([0]), 415], ['invalid', Buffer.from([0xff]), 415], ['big', Buffer.alloc(MAX_FILE_BYTES + 1), 413]]) {
+    await fs.writeFile(path.join(root, name), bytes);
+    await rejectsStatus(() => service.remove({ projectId, path: name, revision }), status);
+    assert.equal((await fs.stat(path.join(root, name))).isFile(), true);
+  }
+  await fs.writeFile(path.join(root, 'safe'), 'safe');
+  await fs.link(path.join(root, 'safe'), path.join(root, 'hard'));
+  await fs.symlink(path.join(root, 'safe'), path.join(root, 'alias'));
+  for (const name of ['hard', 'alias', '.env']) await rejectsStatus(() => service.remove({ projectId, path: name, revision }), 403);
+  await rejectsStatus(() => service.remove({ projectId, path: '../outside', revision }), 400);
+});
+
+test('save and remove share locks and stale delete cannot remove a saved file', async t => {
+  const { service, projectId } = await fixture(t);
+  const original = await service.read({ projectId, path: 'file.txt' });
+  const saved = service.save({ projectId, ...original, content: 'new text' });
+  const removed = service.remove({ projectId, ...original });
+  await saved;
+  await rejectsStatus(() => removed, 409);
+  assert.equal((await service.read({ projectId, path: 'file.txt' })).content, 'new text');
+});
+
+test('search is recursive, literal, case-insensitive and skips protected, dependency and symlink paths', async t => {
+  const { service, projectId, root, directory } = await fixture(t);
+  for (const name of ['nested', 'node_modules', '.git', '.ssh']) await fs.mkdir(path.join(root, name));
+  await fs.writeFile(path.join(root, 'nested', 'Match[1].txt'), 'first\nA literal NEEDLE.* here\nneedle.* again\n');
+  for (const name of ['node_modules/hidden', '.git/hidden', '.ssh/hidden', '.env']) await fs.writeFile(path.join(root, name), 'needle.*');
+  await fs.writeFile(path.join(directory, 'outside'), 'needle.*');
+  await fs.symlink(directory, path.join(root, 'linked-dir'));
+  await fs.symlink(path.join(directory, 'outside'), path.join(root, 'linked-file'));
+  assert.deepEqual(await service.search({ projectId, query: 'MATCH[1]', mode: 'name' }), { results: [{ path: 'nested/Match[1].txt' }], truncated: false });
+  assert.deepEqual(await service.search({ projectId, query: 'needle.*', mode: 'content' }), {
+    results: [
+      { path: 'nested/Match[1].txt', line: 2, preview: 'A literal NEEDLE.* here' },
+      { path: 'nested/Match[1].txt', line: 3, preview: 'needle.* again' },
+    ], truncated: false,
+  });
+  assert.deepEqual((await service.search({ projectId, query: 'NESTED/MATCH', mode: 'name' })).results, [{ path: 'nested/Match[1].txt' }]);
+  assert.deepEqual((await service.search({ projectId, query: '../', mode: 'name' })).results, []);
+  for (const query of ['', 'x'.repeat(201), null]) await rejectsStatus(() => service.search({ projectId, query, mode: 'name' }), 400);
+  await rejectsStatus(() => service.search({ projectId, query: 'x', mode: 'regex' }), 400);
+});
+
+test('content search skips binary, invalid UTF-8, oversized and hardlinked files, and caps results', async t => {
+  const { service, projectId, root } = await fixture(t);
+  for (const [name, bytes] of [['binary', Buffer.from('needle\0')], ['invalid', Buffer.from([110, 101, 101, 100, 108, 101, 255])], ['big', Buffer.alloc(MAX_FILE_BYTES + 1, 97)]]) await fs.writeFile(path.join(root, name), bytes);
+  await fs.writeFile(path.join(root, 'hard'), 'needle');
+  await fs.link(path.join(root, 'hard'), path.join(root, 'hard2'));
+  assert.deepEqual(await service.search({ projectId, query: 'needle', mode: 'content' }), { results: [], truncated: false });
+  await fs.writeFile(path.join(root, 'many'), 'needle\n'.repeat(150));
+  const found = await service.search({ projectId, query: 'needle', mode: 'content' });
+  assert.equal(found.results.length, 100);
+  assert.equal(found.truncated, true);
+  assert.equal(found.results[99].line, 100);
+});
+
+test('name search bounds results and recursion depth', async t => {
+  const { service, projectId, root } = await fixture(t);
+  await Promise.all(Array.from({ length: 105 }, (_, i) => fs.writeFile(path.join(root, `match-${i}`), '')));
+  const names = await service.search({ projectId, query: 'match-', mode: 'name' });
+  assert.equal(names.results.length, 100);
+  assert.equal(names.truncated, true);
+  const deep = Array(34).fill('nested').join('/');
+  await fs.mkdir(path.join(root, deep), { recursive: true });
+  await fs.writeFile(path.join(root, deep, 'unreachable'), 'depth-needle');
+  const content = await service.search({ projectId, query: 'depth-needle', mode: 'content' });
+  assert.deepEqual(content.results, []);
+  assert.equal(content.truncated, true);
+});
+
 test('git diff uses HEAD for only the requested literal filename', async t => {
   const { service, projectId, root } = await fixture(t);
   const exec = promisify(execFile);
@@ -130,11 +234,12 @@ test('git diff uses HEAD for only the requested literal filename', async t => {
   assert.match(result.diff, /\+changed/);
 });
 
-test('registers only five POST routes and returns JSON errors with statuses', async t => {
+test('registers eight POST routes and returns JSON errors with statuses', async t => {
   const { service, projectId } = await fixture(t);
   const routes = [];
   registerRoutes({ connection: { fetch: { register: route => routes.push(route) } } }, service);
-  assert.equal(routes.length, 5);
+  assert.equal(routes.length, 8);
+  assert.deepEqual(routes.map(r => r.path.split('/').at(-1)).sort(), ['create', 'diff', 'open', 'read', 'remove', 'save', 'search', 'tree']);
   for (const route of routes) {
     assert.deepEqual(route.methods, ['POST']);
     assert.equal(route.requestBody, 'buffered');
