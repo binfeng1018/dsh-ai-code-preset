@@ -1,0 +1,15 @@
+{
+  "name": "dsh-ai-coding-workbench-local",
+  "version": "0.1.3",
+  "private": true,
+  "repository": {"type": "git", "url": "https://github.com/binfeng1018/dsh-ai-code-preset.git"},
+  "type": "module",
+  "description": "本地 AI 编程工作台：项目文件、代码编辑、变更审阅与原生 AI 会话",
+  "license": "UNLICENSED",
+  "main": "./dsh/index.js",
+  "exports": {".": "./dsh/index.js", "./client": "./lib/client.js", "./package.json": "./package.json", "./cordis.patch.yml": "./cordis.patch.yml"},
+  "files": ["dsh", "lib", "cordis.patch.yml", "README.md"],
+  "scripts": {"build": "node scripts/build.mjs", "test": "node --test tests/*.test.mjs", "check": "node --check lib/client.js && node --check dsh/index.js"},
+  "dsh": {"bundle": {"patch": "./cordis.patch.yml"}, "client": {"platform": "web", "inject": ["dsh-desktop-workbenches", "@deepseek-ai/dsh-client-ui-workspace", "@deepseek-ai/dsh-client-store"]}},
+  "peerDependencies": {"@deepseek-ai/schemastery": ">=3.18.0 <4.0.0", "dsh-desktop-workbenches": "*"}
+}

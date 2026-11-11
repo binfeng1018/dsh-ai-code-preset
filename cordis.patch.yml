@@ -1,0 +1,4 @@
+- insert:
+    - id: ai-coding-workbench-local
+      name: dsh-ai-coding-workbench-local
+      config: {}
